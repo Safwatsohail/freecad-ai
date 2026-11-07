@@ -8,9 +8,9 @@
     <license file="LICENSE-CODE">LGPL-2.1-or-later</license>
     <license file="LICENSE-ICON">CC0-1.0</license>
     <icon>resources/icons/freecad_ai.svg</icon>
-    <url type="repository" branch="master">https://github.com/ghbalf/freecad-ai</url>
-    <url type="bugtracker">https://github.com/ghbalf/freecad-ai/issues</url>
-    <url type="readme">https://github.com/ghbalf/freecad-ai/blob/master/Resources/Documents/Overview.md</url>
+    <url type="repository" branch="master">https://github.com/Safwatsohail/freecad-ai</url>
+    <url type="bugtracker">https://github.com/Safwatsohail/freecad-ai/issues</url>
+    <url type="readme">https://github.com/Safwatsohail/freecad-ai/blob/master/Resources/Documents/Overview.md</url>
     <tag>AI</tag>
     <tag>LLM</tag>
     <tag>assistant</tag>
