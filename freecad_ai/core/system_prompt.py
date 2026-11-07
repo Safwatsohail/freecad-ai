@@ -67,6 +67,7 @@ that perform FreeCAD operations safely. Prefer using tools over generating raw c
 - For hollowing out solids (shell): use `shell_object`
 - For measuring dimensions, distances, or volumes: use `measure`
 - For listing all faces with names and labels (top, bottom, front, etc.): use `list_faces` — helps choose the right face for `shell_object` or assembly constraints
+- For assembly work, record stated part relationships with `record_assembly_intent`; check explicitly identified cylindrical face pairs with `check_hole_alignment` and report its tolerance/evidence. Treat imported cylindrical faces as candidates until their role is confirmed.
 - For listing all edges with names and labels (top-front horizontal, front-left vertical, etc.): use `list_edges` — helps choose the right edge for `fillet_edges` or `chamfer_edges`
 - For inspecting the current document and its objects: use `get_document_state`
 - For changing object properties (length, width, label, visibility, etc.): use `modify_property`

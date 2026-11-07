@@ -5,10 +5,21 @@ Tools are designed to be called by the LLM via structured tool calling.
 """
 
 import os
-
 from .registry import ToolParam, ToolDefinition, ToolResult
 from ..core.executor import execute_code
 
+def _handle_search_cad_library(
+    query: str,
+    thread: str = "",
+    length_mm: float | None = None,
+    head_style: str = "",
+    standard: str = "",
+    category: str = "",
+) -> ToolResult:
+    """Search a global CAD library for matching user input."""
+    import requests
+    from .cad_reranker import handle_search_cad_library as _search
+    return _search(query, thread, length_mm, head_style, standard, category)
 
 def _coerce_str_list(value):
     """Coerce a stringified list into an actual list.
@@ -3570,8 +3581,61 @@ MODIFY_PROPERTY = ToolDefinition(
     ],
     handler=_handle_modify_property,
 )
+#----import_model────────────────────────────────────────────
+def _handle_import_model(
+    filename: str = "",
+    step_url: str = "",
+    label: str = "",
+) -> ToolResult:
+    """Import a model from a local file or a step.parts URL into the active document."""
+    import tempfile, os
 
+    # Determine source
+    if step_url and not filename:
+        suffix = ".step" if ".step" in step_url.lower() else ".stp"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            import urllib.request
+            with urllib.request.urlopen(step_url, timeout=30) as resp:
+                tmp.write(resp.read())
+            filename = tmp.name
 
+    if not filename:
+        return ToolResult(success=False, output="", error="Provide filename or step_url")
+
+    if not os.path.isfile(filename):
+        return ToolResult(success=False, output="", error=f"File not found: {filename}")
+
+    def do(doc):
+        import Import
+        imported = Import.insert(filename, doc.Name)
+        doc.recompute()
+        names = [o.Name for o in doc.Objects if o.Label == os.path.basename(filename)]
+        result_names = [o.Name for o in doc.Objects]
+        return ToolResult(
+            success=True,
+            output=f"Imported model from {os.path.basename(filename)}",
+            data={"filename": filename, "new_objects": len(names)},
+        )
+
+    # Clean up temp file if downloaded
+    try:
+        result = _with_undo("Import Model", do)
+    finally:
+        if step_url and filename and os.path.exists(filename):
+            os.unlink(filename)
+    return result
+
+IMPORT_MODEL = ToolDefinition(
+    name="import_model",
+    description="Import a CAD model into the active document from a local STEP file or a step.parts URL. Use step_url for parts found via search_cad_library.",
+    category="file",
+    parameters=[
+        ToolParam("filename", "string", "Path to local STEP/STP file", required=False, default=""),
+        ToolParam("step_url", "string", "URL to download STEP from (e.g. from search_cad_library)", required=False, default=""),
+        ToolParam("label", "string", "Optional display label", required=False, default=""),
+    ],
+    handler=_handle_import_model,
+)
 # ── export_model ────────────────────────────────────────────
 
 def _handle_export_model(
@@ -5950,9 +6014,116 @@ ADD_PART_TO_ASSEMBLY = ToolDefinition(
 )
 
 
+# ── Persistent assembly intent ──────────────────────────────
+
+def _intent_object(doc, create=False):
+    obj = doc.getObject("AssemblyIntent")
+    if obj or not create:
+        return obj
+    obj = doc.addObject("App::FeaturePython", "AssemblyIntent")
+    obj.Label = "Assembly Intent"
+    obj.addProperty("App::PropertyString", "Relationships", "Assembly Intent",
+                    "JSON records of semantic assembly relationships")
+    obj.Relationships = "[]"
+    return obj
+
+
+def _handle_record_assembly_intent(part_a: str, relation: str, part_b: str,
+                                   requirement: str = "") -> ToolResult:
+    """Persist a human/agent stated relationship in the document."""
+    import json
+    def run(doc):
+        a, b = _get_object(doc, part_a), _get_object(doc, part_b)
+        if not a or not b:
+            return ToolResult(success=False, output="", error="Both parts must exist in the document.")
+        store = _intent_object(doc, True)
+        records = json.loads(store.Relationships or "[]")
+        records.append({"part_a": a.Name, "relation": relation, "part_b": b.Name,
+                        "requirement": requirement, "source": "user_or_agent_stated"})
+        store.Relationships = json.dumps(records, sort_keys=True)
+        return ToolResult(success=True, output=f"Recorded intent: {a.Label} {relation} {b.Label}.",
+                          data={"relationships": records})
+    return _with_undo("Record assembly intent", run)
+
+
+RECORD_ASSEMBLY_INTENT = ToolDefinition(
+    name="record_assembly_intent",
+    description="Store a semantic relationship between two parts in the FreeCAD document, such as 'mounts on' or 'spacer between'. This records stated design intent; it does not infer geometry.",
+    category="assembly",
+    parameters=[ToolParam("part_a", "string", "First part name or label"),
+                ToolParam("relation", "string", "Relationship, e.g. mounts on, aligns with, sits between"),
+                ToolParam("part_b", "string", "Second part name or label"),
+                ToolParam("requirement", "string", "Optional measurable requirement or note", required=False, default="")],
+    handler=_handle_record_assembly_intent,
+)
+
+
+def _handle_check_hole_alignment(part_a: str, face_a: str, part_b: str,
+                                 face_b: str, tolerance_mm: float = 0.1) -> ToolResult:
+    """Compare explicitly selected cylindrical face axes as candidate holes."""
+    import FreeCAD as App
+    doc = App.ActiveDocument
+    if not doc:
+        return ToolResult(success=False, output="", error="No active document")
+    a, b = _get_object(doc, part_a), _get_object(doc, part_b)
+    if not a or not b:
+        return ToolResult(success=False, output="", error="Both parts must exist in the document.")
+    try:
+        fa, fb = a.Shape.getElement(face_a), b.Shape.getElement(face_b)
+        sa, sb = fa.Surface, fb.Surface
+        if "Cylinder" not in type(sa).__name__ or "Cylinder" not in type(sb).__name__:
+            raise ValueError("Both selected faces must be cylindrical surfaces.")
+        va, vb = sa.Axis, sb.Axis
+        dot = va.dot(vb)
+        parallel_error = 1.0 - abs(dot)
+        delta = fb.CenterOfMass - fa.CenterOfMass
+        perpendicular = delta.cross(va).Length
+        aligned = parallel_error <= 1e-5 and perpendicular <= tolerance_mm
+        result = {"aligned": aligned, "axis_offset_mm": round(perpendicular, 5),
+                  "parallel_error": round(parallel_error, 8), "tolerance_mm": tolerance_mm,
+                  "faces": [face_a, face_b], "interpretation": "candidate cylindrical-face alignment"}
+        verdict = "pass" if aligned else "fail"
+        return ToolResult(success=True, output=f"Hole-axis alignment {verdict}: offset {perpendicular:.4f} mm (tolerance {tolerance_mm:g} mm). Cylindrical faces are treated as candidates, not confirmed holes.", data=result)
+    except Exception as exc:
+        return ToolResult(success=False, output="", error=f"Could not check alignment: {exc}")
+
+
+CHECK_HOLE_ALIGNMENT = ToolDefinition(
+    name="check_hole_alignment",
+    description="Check whether two explicitly selected cylindrical faces have parallel axes and align within tolerance. Reports geometric evidence; cylindrical faces are candidates and are not asserted to be holes.",
+    category="assembly",
+    parameters=[ToolParam("part_a", "string", "First part name or label"),
+                ToolParam("face_a", "string", "Cylindrical face on first part, e.g. Face3"),
+                ToolParam("part_b", "string", "Second part name or label"),
+                ToolParam("face_b", "string", "Cylindrical face on second part"),
+                ToolParam("tolerance_mm", "number", "Maximum axis offset in mm", required=False, default=0.1)],
+    handler=_handle_check_hole_alignment,
+)
+SEARCH_CAD_LIBRARY = ToolDefinition(
+    name="search_cad_library",
+    description=(
+        "Search a global CAD parts library for fasteners and components. "
+        "Optionally filter by thread (e.g. M6), length in mm, head style "
+        "(e.g. hex), standard (e.g. DIN 933), or category (e.g. bolt). "
+        "Ranks results by match score and validates the top match's STEP geometry."
+    ),
+    category="modeling",
+    parameters=[
+        ToolParam("query", "string", "Search query, e.g. 'M6 screw'"),
+        ToolParam("thread", "string", "Thread designation (e.g. 'M6')", required=False),
+        ToolParam("length_mm", "number", "Desired length in mm", required=False),
+        ToolParam("head_style", "string", "Head style (e.g. 'hex')", required=False),
+        ToolParam("standard", "string", "Standard (e.g. 'DIN 933')", required=False),
+        ToolParam("category", "string", "Category (e.g. 'bolt')", required=False),
+    ],
+    handler=_handle_search_cad_library,
+)
+
 # ── All tools ───────────────────────────────────────────────
 
 ALL_TOOLS = [
+    IMPORT_MODEL,
+    SEARCH_CAD_LIBRARY,
     CREATE_PRIMITIVE,
     CREATE_BODY,
     CREATE_SKETCH,
@@ -6008,5 +6179,7 @@ ALL_TOOLS = [
     CREATE_ASSEMBLY,
     ADD_ASSEMBLY_JOINT,
     ADD_PART_TO_ASSEMBLY,
+    RECORD_ASSEMBLY_INTENT,
+    CHECK_HOLE_ALIGNMENT,
     SELECT_GEOMETRY,
 ]
